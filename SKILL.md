@@ -469,3 +469,242 @@ Confirmed on iOS + Android dev-client after a clean worklet-ize-Manual pass:
 
 **The single critical new lesson:** see the `state.fail() / state.end()` mid-gesture bullet in §8. It only surfaces after the pass — the OLD `runOnJS(true)` shape silently dropped the mid-gesture state transitions, which made the pattern accidentally "work". With proper UI-thread state transitions, calling `state.fail()` from `onTouchesDown` triggers `Ended a touch event which was not counted in trackedTouchCount` AND breaks the very SV-gate propagation the worklet-ize was supposed to fix.
 
+## 12. Bg-space normalisation: items follow the image, not the canvas
+
+Earlier sections (§3, §6) showed items normalised against `canvasSize` (`cx * canvasSize.width`). That's only correct when canvas aspect ratio always matches bg-image aspect ratio. **The moment your canvas can change aspect independently of the bg (device rotate, window resize, sidebar collapse), canvas-normalisation breaks two things at once:** items drift from the bg position AND distort their shape.
+
+### The bug, visually
+
+```
+Bg image 1000×1000 (square)
+
+Portrait canvas 400×800 (aspect 0.5)        Landscape canvas 800×400 (aspect 2.0)
++--------+                                   +------------------+
+|░░░░░░░░|  ← letterbox top/bottom           |████████████████|
+|███▢████|  item cx=0.5, cy=0.5              |██  ▭ NOT THE  ██|  same item
+|████████|  → cxPx=200, cyPx=400             |██  SAME PLACE ██|  → cxPx=400, cyPx=200
+|░░░░░░░░|  rx=0.1, ry=0.1                   |████████████████|  width=160, height=80
++--------+  → 80×160 = TALL rect             +------------------+  WIDE rect (not square!)
+```
+
+Bg uses `contain`-fit (letterboxed). Items use canvas-fractions. The two coordinate systems only coincide when canvas aspect = bg aspect. Any rotate / resize breaks placement AND shape.
+
+### The fix: normalise to a bg-rect
+
+Compute the canvas-pixel rect where the bg actually renders (`contain`-fit math), and normalise items against THAT rect. Render Background explicitly at the same rect so the two are 1:1 by construction. The data inside `cx`/`cy`/`rx`/`ry` stays 0–1, only the *meaning* changes: "fraction of bg-image", not "fraction of canvas".
+
+```typescript
+// items/_shared.ts — workletized helpers
+export type BgRect = { x: number; y: number; w: number; h: number };
+
+export function computeBgRect(bgW: number, bgH: number, canvasSize: CanvasSize): BgRect {
+  'worklet';
+  if (!bgW || !bgH || !canvasSize.width || !canvasSize.height) {
+    return { x: 0, y: 0, w: canvasSize.width, h: canvasSize.height };
+  }
+  const canvasAspect = canvasSize.width / canvasSize.height;
+  const bgAspect = bgW / bgH;
+  let w: number, h: number;
+  if (bgAspect > canvasAspect) { w = canvasSize.width; h = canvasSize.width / bgAspect; }
+  else { h = canvasSize.height; w = canvasSize.height * bgAspect; }
+  return { x: (canvasSize.width - w) / 2, y: (canvasSize.height - h) / 2, w, h };
+}
+
+export function projectPoint(pN: CanvasPoint, bgRect: BgRect): CanvasPoint {
+  'worklet';
+  return { x: bgRect.x + pN.x * bgRect.w, y: bgRect.y + pN.y * bgRect.h };
+}
+
+export function unprojectDelta(d: CanvasDelta, bgRect: BgRect) {
+  'worklet';
+  return { dnx: d.dx / bgRect.w, dny: d.dy / bgRect.h };
+}
+```
+
+All item math switches from `* canvasSize.width / .height` to `* bgRect.w / .h` with an added `bgRect.x / .y` base offset. The `ItemType` signature changes `canvasSize: CanvasSize` → `bgRect: BgRect` across `hitTest`, `getEditableHandles`, `getCenter`, `applyHandleDrag`, `applyBodyDrag`, `applyPinchTransform`.
+
+### Render path
+
+Background must render at the *exact* same bg-rect the items normalise against — don't trust `resizeMode="contain"` to compute it for you, because then the rendered position is browser/native-side and your JS-computed bgRect might differ by sub-pixel rounding. Render the bg-image explicitly:
+
+```tsx
+const rectStyle = useAnimatedStyle(() => ({
+  position: 'absolute',
+  left: bgRectSv.value.x, top: bgRectSv.value.y,
+  width: bgRectSv.value.w, height: bgRectSv.value.h,
+}));
+return (
+  <Animated.View pointerEvents="none" style={[StyleSheet.absoluteFill, transformStyle]}>
+    <Animated.Image source={{ uri: bgImage.url }} style={rectStyle} resizeMode="stretch" />
+  </Animated.View>
+);
+```
+
+ItemLayer's SVG container still uses `canvasSize.width / .height` (it's the viewport), but items inside compute their positions via `bgRect`. The `<Animated.View>` bg-transform wraps both layers identically so they pan/zoom in sync.
+
+### Worklet vs JS thread parity
+
+Expose **both** a derived React-state `bgRect` (for JS-thread renderers — ItemLayer, Background, LiveStrokeOverlay) and a `bgRectSv` (for worklet readers — gesture pipeline):
+
+```typescript
+const bgRect = useMemo<BgRect>(
+  () => computeBgRect(bgImage.w, bgImage.h, canvasSize),
+  [bgImage.w, bgImage.h, canvasSize],
+);
+const bgRectSv = useDerivedValue<BgRect>(() =>
+  computeBgRect(bgImageSv.value.w, bgImageSv.value.h, canvasSizeSv.value),
+);
+```
+
+Both compute via the same helper so they stay in lockstep. The gesture pipeline reads `bgRectSv.value` for item math; `toSourcePoint` (the canvas-centre bg-transform inverse) keeps using `canvasSize` because the scale-around-centre formula doesn't change.
+
+### Helper extraction (cleanup while you're touching every item)
+
+The bg-space pass touches every `ItemType` anyway — extract these patterns at the same time:
+
+```typescript
+// Used by 5 of 7 items (rect/ring/text/device/+ pinch centre updates)
+export function applyCenterBodyDragN(
+  cx: number, cy: number, delta: CanvasDelta, bgRect: BgRect,
+): { cx: number; cy: number } {
+  'worklet';
+  return {
+    cx: clamp01(cx + delta.dx / bgRect.w),
+    cy: clamp01(cy + delta.dy / bgRect.h),
+  };
+}
+
+// Rotation-handle drag — used by 4 items (rect/ring/text/device)
+// Replaces ~12 identical lines × 4 items = ~48 lines → 4 calls.
+export function computeRotationFromHandleDrag(
+  centerPx: CanvasPoint, halfHeightPx: number,
+  currentRotationDeg: number, delta: CanvasDelta,
+): number {
+  'worklet';
+  const rad = (currentRotationDeg * Math.PI) / 180;
+  const orig = rotateLocal(0, -halfHeightPx - ROTATE_HANDLE_OFFSET_PX, rad);
+  const newWorldX = centerPx.x + orig.x + delta.dx;
+  const newWorldY = centerPx.y + orig.y + delta.dy;
+  const angle = Math.atan2(newWorldY - centerPx.y, newWorldX - centerPx.x);
+  return (angle * 180) / Math.PI + 90;
+}
+```
+
+### Migration caveat
+
+`cx = 0.5` semantically changes from "canvas-centre" to "bg-image-centre". Items stored in DB under the old normalisation will display **off** after the switch. Don't write a dual-read shim — DB-wipe is the path of least friction for unmigrated state. For production data you genuinely want to keep: backfill `cx_new = (cx_old * canvasW - bgRect.x) / bgRect.w` (and likewise for cy).
+
+## 13. Bg pan/pinch clamp: elastic rubber-band + spring snap-back
+
+`Gesture.Pan().onUpdate(e => { bgTx.value = startTx.value + e.translationX })` with no clamp lets the user pan the bg infinitely off-screen. The fix has three parts: bound math, iOS-style rubber-band damping under the finger, and `withSpring` snap-back on release.
+
+### Bound math
+
+The bg renders inside `bgRect` (canvas pixels) and is then scaled around the canvas centre by `bgScale`. After the scale-around-centre transform, the bg's centre stays at canvas-centre + (bgTx, bgTy). Bound to keep the bg always covering the canvas viewport:
+
+```
+|bgTx| ≤ max(0, (bgRect.w * scale − canvasW) / 2)
+|bgTy| ≤ max(0, (bgRect.h * scale − canvasH) / 2)
+```
+
+The `max(0, ...)` matters: when `bgRect * scale < canvasSize` (e.g. letterboxed bg at scale 1), the bound goes negative — clamp to 0 = "no pan allowed". As scale grows past 1, the bound grows linearly — at max-zoom every corner of the bg can fill the viewport.
+
+```typescript
+export function clampBgTranslation(
+  tx: number, ty: number, scale: number, bgRect: BgRect, canvasSize: CanvasSize,
+): { tx: number; ty: number } {
+  'worklet';
+  const maxAbsTx = Math.max(0, (bgRect.w * scale - canvasSize.width) / 2);
+  const maxAbsTy = Math.max(0, (bgRect.h * scale - canvasSize.height) / 2);
+  return {
+    tx: Math.max(-maxAbsTx, Math.min(maxAbsTx, tx)),
+    ty: Math.max(-maxAbsTy, Math.min(maxAbsTy, ty)),
+  };
+}
+```
+
+### UIKit rubber-band (the iOS Photos formula)
+
+```
+y = (1 − 1 / (over · c / d + 1)) · d
+```
+
+Where `over` is how far past the bound the value is, `c = 0.55` (UIKit constant), `d` is the dimension the bg is being pulled along (canvas width/height). Within the bound, value passes through 1:1. Past it, the excess is compressed asymptotically — the further you drag, the slower the bg follows.
+
+```typescript
+function rubberBand1D(value: number, max: number, dim: number): number {
+  'worklet';
+  if (Math.abs(value) <= max) return value;
+  const over = Math.abs(value) - max;
+  const c = 0.55;
+  const d = Math.max(1, dim);
+  const dampened = (1 - 1 / ((over * c) / d + 1)) * d;
+  return Math.sign(value) * (max + dampened);
+}
+
+export function rubberBandBgTranslation(
+  tx: number, ty: number, scale: number, bgRect: BgRect, canvasSize: CanvasSize,
+): { tx: number; ty: number } {
+  'worklet';
+  const maxAbsTx = Math.max(0, (bgRect.w * scale - canvasSize.width) / 2);
+  const maxAbsTy = Math.max(0, (bgRect.h * scale - canvasSize.height) / 2);
+  return {
+    tx: rubberBand1D(tx, maxAbsTx, canvasSize.width),
+    ty: rubberBand1D(ty, maxAbsTy, canvasSize.height),
+  };
+}
+```
+
+### Wire-up
+
+```typescript
+// Native Pan — rubber-band while dragging, spring back on release
+Gesture.Pan()
+  .onUpdate(e => {
+    'worklet';
+    if (!bgEnabled.value) return;
+    const rb = rubberBandBgTranslation(
+      startTx.value + e.translationX, startTy.value + e.translationY,
+      bgScale.value, bgRectSv.value, canvasSizeSv.value,
+    );
+    bgTx.value = rb.tx; bgTy.value = rb.ty;
+  })
+  .onEnd(() => {
+    'worklet';
+    const c = clampBgTranslation(
+      bgTx.value, bgTy.value, bgScale.value, bgRectSv.value, canvasSizeSv.value,
+    );
+    bgTx.value = withSpring(c.tx);
+    bgTy.value = withSpring(c.ty);
+  });
+
+// Pinch — re-clamp tx/ty on every scale change. CRITICAL: zoom-out shrinks
+// the valid translation window, and without this re-clamp the bg sticks
+// outside the (now smaller) bound and only snaps back on the NEXT pan release.
+Gesture.Pinch()
+  .onUpdate(e => {
+    'worklet';
+    if (!bgEnabled.value) return;
+    const next = Math.max(MIN_BG_SCALE, Math.min(MAX_BG_SCALE, startScale.value * e.scale));
+    bgScale.value = next;
+    const c = clampBgTranslation(bgTx.value, bgTy.value, next, bgRectSv.value, canvasSizeSv.value);
+    bgTx.value = c.tx; bgTy.value = c.ty;
+  });
+```
+
+### Native vs web split
+
+| Input | Behaviour | Reason |
+|---|---|---|
+| Native touch (`Gesture.Pan`) | Elastic rubber-band + spring snap-back | iOS Photos / Scroll View convention — what fingers expect |
+| Web mouse (drag, wheel) | Hard clamp (Maps-style) | Cursor input doesn't carry the iOS elasticity convention; springs feel weird with a mouse |
+
+Both share the `clampBgTranslation` helper. Native additionally uses `rubberBandBgTranslation` during `onUpdate` and `withSpring(clamped.tx)` in `onEnd`.
+
+### Gotchas
+
+- **Re-clamp on Pinch.onUpdate is non-obvious.** Skipping it leaves the bg stuck outside the new bound until the next pan release. Not a visible bug during pinch (the user is busy zooming), but the bg "snaps" the next time they pan — which feels broken.
+- **`withSpring(0)` at MIN scale, not direct assign.** Pinch.onEnd's "snap back to centre when scale reaches 1" should also spring, not set instantly, otherwise the transition from "rubber-banded" to "centred" is a visual jump.
+- **Don't try to rubber-band the pinch itself.** Scale changes via pinch are about the focal point, not a translation. Pinch uses hard clamp during, spring during onEnd-snap-to-min.
+- **Bounds grow with scale, not bgRect.** At scale 1 with letterboxed bg, bound is 0 (no pan). At scale 1 with bg-aspect = canvas-aspect, bound is also 0. At scale 2+, bound grows for both axes — full bg becomes navigable.
+
