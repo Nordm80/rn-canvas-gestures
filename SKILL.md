@@ -362,7 +362,7 @@ const centerDelta = {
 ## 8. Critical gotchas
 
 - **Worklets cannot read `useRef().current`.** They capture stale values at worklet-init time. Mirror via `useSharedValue` or pass through the gesture's event object. *Symptom:* worklet silently uses zero / initial values, gesture-pipeline appears broken downstream.
-- **Reanimated 4 warning `setGestureState in non-worklet function`** is **cosmetic** — fires because Manual's `runOnJS(true)` callbacks call `state.activate()/fail()` from JS. Ignore for the spike. Cleaning it requires making Manual fully worklet-based (mirror items + canvasSize as shared values).
+- **Reanimated 4 warning `setGestureState in non-worklet function`** is **not cosmetic** — fires because `Manual.runOnJS(true)` callbacks call `state.activate()/fail()` from the JS thread, and Reanimated 4 expects them on the UI thread. The JS↔UI marshalling window (~8ms idle, ~60-100ms under GC / slow Android / accessibility tools) means `state.activate()` can land *after* the gesture has already advanced natively (touch lifted, second finger arrived, another gesture cancelled it). Symptoms at scale: stuck Manual gestures, lost taps, bg panning under an item drag, `onTouchesUp` firing on a FAILED gesture. Several patterns in this recipe — the default-false `bgEnabled` gate, `Pan.minDistance` synced to Manual's defer threshold, the `Simultaneous`-with-gate-instead-of-`Race` choice, and likely the freehand `onTouchEnd` guard — exist specifically to compensate for this thread-hop. **Acceptable for spikes and single-device dev testing. Not acceptable as a long-term state for production apps at scale** — schedule a worklet-ize-Manual pass (mirror `items` + `canvasSize` + selection as shared values, mark every `ItemType.hitTest` `'worklet'`, replace the registry Map with a worklet-callable dispatch, drop `runOnJS(true)`). See §11 for the upgrade path. **Don't suppress with `LogBox.ignoreLogs`** — it hides a signal you need for debugging the latent races.
 - **`Gesture.Race` is unreliable with `runOnJS(true)`.** The JS-thread fail() doesn't propagate fast enough to cancel the worklet-thread Pinch/Pan winners. Use `Simultaneous` + shared-value gate instead.
 - **`requireExternalGestureToFail(itemManual)` also unreliable with runOnJS.** Pinch/Pan stay blocked forever because Manual's fail-state on JS thread doesn't propagate to the dependent gestures' worklet thread.
 - **Android `ScrollView.maximumZoomScale` is iOS-only.** If existing code uses ScrollView for bg pinch, that's why Android is broken. Rip it out, use `Gesture.Pinch`.
@@ -416,3 +416,42 @@ Common refactors to apply:
 | Reading `canvasSizeRef.current.width` inside a worklet | Either mirror as a shared value, or remove the use of that dimension from the worklet |
 
 If you see ALL of these in one file, you're looking at pre-2025 RN gesture code. Rewrite the gesture file, leave the item rendering alone.
+
+## 11. Production-scale upgrade path: worklet-ize `Gesture.Manual`
+
+The recipe in §1-§10 is a working spike. Several of its defensive patterns exist *because* `Gesture.Manual().runOnJS(true)` puts gesture state transitions on the JS thread — see §8 on the `setGestureState in non-worklet function` warning. For an app shipping to thousands of users on diverse devices, schedule a worklet-ize-Manual pass to eliminate the thread-hop and the latent race class it creates.
+
+### What "worklet-ize Manual" means
+
+Drop `runOnJS(true)` and make `Manual`'s `onTouchesDown / onTouchesMove / onTouchesUp` callbacks worklet-compatible. Every value they read/write must be:
+
+- A shared value (`items`, `canvasSize`, `selectedId`, `mode` → mirrored from React state via `useSharedValue` and dual-written on every mutator),
+- A pure function annotated `'worklet'` (every `ItemType.hitTest`, `getEditableHandles` — they're already pure-math but need the directive + a closure-audit),
+- Or wrapped in `runOnJS(...)` for the one-shot React-thread side-effects that must remain (e.g. `onSelect`, `setItemsLive`, `addItem`, `onBeginEdit`).
+
+The gesture state transitions (`state.activate()`, `state.fail()`) then happen synchronously on the UI thread next to the native gesture lifecycle; React-thread side-effects fire async without blocking the gesture.
+
+### What can be removed once Manual is worklet-based
+
+| Defensive pattern | Decision after worklet-ize |
+|---|---|
+| `bgEnabled` default-false gate | Simplify — pinch/pan worklets can read items + sel directly and decide inline. Likely still keep a single boolean but the default-false-then-unlock pattern goes away. |
+| `Pan.minDistance(DEFER_COMMIT_RAW_PX)` synced to Manual's defer threshold | Remove — Pan can activate immediately, the gate evaluates synchronously. |
+| `Gesture.Simultaneous(itemManual, pinch, pan)` + gate | Re-evaluate — `Gesture.Race` should now work since Manual's `state.fail()` propagates synchronously. Race is the cleaner architecture if it tests cleanly. |
+| Freehand `onTouchEnd` guard for `state.fail()`-ed Manual still firing `onTouchesUp` | Test empirically. RNGH platform quirk may persist; if so, keep the guard. |
+
+### Concrete risks
+
+- **Hit-test closures.** Audit every `ItemType.hitTest` to confirm it reads only its args. Capturing module state / React refs in a worklet silently fails.
+- **`getItemType` registry Map → worklet dispatch.** Map access from worklets is unsupported. Replace with a worklet-callable switch on `kind`.
+- **Dual-writing items.** Every Provider mutator (`addItem`, `updateItem`, `removeItem`, `undo`, `setItemsLive`, `trashAll`) must write through both React state and the shared-value mirror. One missed write = silently desynced hit-testing.
+- **Loss of React debuggability.** Worklet logic is harder to step through than JS-thread code. Document this in the PR description so future contributors aren't lost.
+
+### Verification
+
+Reproduce the original race by deliberately stalling the JS thread for 80ms (`const end = Date.now() + 80; while (Date.now() < end) {}`) right before a touch sequence and verify gesture state stays coherent. Run device verification on at least one slow Android (≥ 3 years old) — that's where the latent races show up first.
+
+### What does NOT change
+
+Source-space hit-testing (§4), rotation math (§6), 2-finger pinch math (§7), web DOM listeners (§5) — all unchanged by worklet-ize. The web path bypasses RNGH already (web JS is single-threaded; no thread-hop) so web has no upgrade work.
+
