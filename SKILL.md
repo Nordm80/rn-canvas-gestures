@@ -374,6 +374,7 @@ const centerDelta = {
 - **When the user has a selection and lands 2 fingers OUTSIDE the selected item, deselect** (the user clearly isn't operating on it). Stale `selectedIdRef` from rapid sequential touch-downs can cause "phantom resize" of a just-deselected item if you don't handle this.
 - **Mouse-drag on web for bg-pan must call `e.preventDefault()`** in mousedown — otherwise browser text-selection drag fires alongside and ruins the UX.
 - **Reset `bgEnabled = false` in `onTouchEnd`**, not just at gesture composition init. Each new touch sequence must start in the gated state.
+- **Never call `state.fail()` / `state.end()` mid-gesture in `Manual` handlers.** Only call them on the terminal touch-up (when all fingers have lifted, `remaining.length === 0`). Calling `state.fail()` from `onTouchesDown` (e.g. a priority-3 "bg pinch, hand off to Pinch/Pan" branch) or `onTouchesMove` (e.g. deferred-→-bg-pan commit) desyncs RNGH's internal `trackedTouchCount` — touches are still active on the screen but Manual stopped counting them. *Symptoms:* warning `Ended a touch event which was not counted in trackedTouchCount` on every gesture, AND RNGH suppresses further event delivery to the failed Manual so any shared values Manual sets later in the gesture (like `bgEnabled`) appear stuck at their pre-fail value when read by Pinch/Pan worklets. **Fix:** for "I don't want to claim, let Pinch/Pan take over" cases return a `'defer'` / `'continue'` decision and leave Manual in BEGAN; clear `dragState` synchronously so subsequent `onTouchesMove` no-ops via your existing `if (!drag.itemId)` guard. Clean up and call `state.fail()` only when `onTouchesUp` fires with `remaining.length === 0`. With the old `runOnJS(true)` shape this rule was hidden because mid-gesture fails were silently dropped (see the `setGestureState in non-worklet function` bullet above); it only surfaces after the worklet-ize pass.
 
 ## 9. Verification checklist
 
@@ -454,4 +455,17 @@ Reproduce the original race by deliberately stalling the JS thread for 80ms (`co
 ### What does NOT change
 
 Source-space hit-testing (§4), rotation math (§6), 2-finger pinch math (§7), web DOM listeners (§5) — all unchanged by worklet-ize. The web path bypasses RNGH already (web JS is single-threaded; no thread-hop) so web has no upgrade work.
+
+### Empirical: what survived the pass (2026-05-28, Expo SDK 56)
+
+Confirmed on iOS + Android dev-client after a clean worklet-ize-Manual pass:
+
+| Defensive pattern | Outcome |
+|---|---|
+| `bgEnabled` SV gate | **Kept.** Could be replaced by inline `dragSv` + `selectedIdSv` + `modeSv` reads in Pan/Pinch `onUpdate` worklets, but no behaviour win — `bgEnabled` is clearer as an explicit synchronous gate that Manual handlers set as part of their state-machine decision. |
+| `Pan.minDistance(DEFER_COMMIT_RAW_PX)` synced to Manual's defer threshold | **Kept.** Without it, Pan activates during the pre-threshold deferred-tap window and shifts the bg before itemDrag commits. Safe removal needs a careful Pan/Manual handoff protocol; not worth the risk. |
+| `Gesture.Simultaneous` instead of `Gesture.Race` | **Kept.** Race is plausibly cleaner now that `state.fail()` is synchronous, but needs operator device verification across all four gestures before the swap. The inline `bgEnabled` gate is correct on its own. |
+| Freehand `onTouchEnd` `if (!st.active) return` guard | **Kept.** Confirmed still an RNGH platform quirk (failed Manual can still fire `onTouchesUp`), not a thread-hop artifact. |
+
+**The single critical new lesson:** see the `state.fail() / state.end()` mid-gesture bullet in §8. It only surfaces after the pass — the OLD `runOnJS(true)` shape silently dropped the mid-gesture state transitions, which made the pattern accidentally "work". With proper UI-thread state transitions, calling `state.fail()` from `onTouchesDown` triggers `Ended a touch event which was not counted in trackedTouchCount` AND breaks the very SV-gate propagation the worklet-ize was supposed to fix.
 
